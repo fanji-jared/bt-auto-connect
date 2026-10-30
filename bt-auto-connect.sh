@@ -4,16 +4,19 @@
 # ---------------------------------------------------------------------------
 # 面向 Orange Pi / ARM SBC 的蓝牙键鼠自动连接守护脚本
 #
-# 功能：
-#   1. 默认从 Blueman「最近连接」缓存读取目标设备列表（按 MAC 直连）
-#   2. 缓存为空时回退到手动维护列表（支持 名称 / MAC / 名称+MAC 三种条目）
-#   3. 同名多设备按 RSSI 信号强度择优连接
-#   4. 单次扫描最长 5 分钟，全部连上即提前退出
-#   5. 无参数运行 = 安装向导（自动装 systemd 开机自启）
+# 两种匹配模式：
+#   --name-first（默认）：按设备名称扫描，同名多设备按 RSSI 信号择优
+#                         适合外设 MAC 会变化、但名称固定的场景
+#   --mac-first：       直接按 MAC 地址连接，跳过名称匹配
+#                         适合 MAC 固定、或你想强制直连某个设备的场景
 #
-# 适用场景：
-#   蓝牙适配器每次重启 MAC 随机、BlueZ 配对库无法跨重启保留的 SBC
-#   （例如 Orange Pi 3B + RTL8761B 模组）
+# 两个数据来源：
+#   1. Blueman「最近连接」缓存（gsettings，重启不丢）
+#   2. 手动维护列表 /etc/bt_autoconnect_devices.list（支持 名称 / MAC / 名称+MAC）
+#
+# 其他特性：
+#   - 单次扫描最长 5 分钟，全部连上即提前退出
+#   - 无参数运行 = 安装向导（自动装 systemd 开机自启）
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -60,8 +63,8 @@ is_installed() {
 
 # ===========================================================================
 # Blueman 缓存读取
-# gsettings 里 recent-connections 是一个 dict 数组，形如：
-#   [{'adapter': '..', 'address': 'AA:BB:..', 'alias': 'GPW G3', ...}, ...]
+# gsettings 里 recent-connections 是一个 dict 数组：
+#   [{'address': 'AA:BB:..', 'alias': '我的键盘', ...}, ...]
 # 这里只抽 alias + address 两列输出，用 TAB 分隔
 # ===========================================================================
 read_blueman_pairs() {
@@ -173,52 +176,99 @@ try_connect() {
 
 # ===========================================================================
 # run：主连接循环
+#   参数：
+#     --name-first   默认。按名称扫描匹配，同名按 RSSI 择优
+#     --mac-first    按 MAC 直连，跳过名称匹配
+#     --list         强制使用手动列表，不读 Blueman 缓存
 # ===========================================================================
 cmd_run() {
     check_deps
+
+    local mac_first=0
+    local force_list=0
+    for arg in "$@"; do
+        case "$arg" in
+            --mac-first)   mac_first=1 ;;
+            --name-first) mac_first=0 ;;
+            --list)       force_list=1 ;;
+        esac
+    done
+
     hciconfig hci0 up >/dev/null 2>&1 || true
 
-    declare -A targets=()     # key=MAC 或 __NAME__::名字，value=展示名
+    # 两类目标：
+    #   name_targets[]  —— 按名称扫描匹配
+    #   mac_targets[]   —— 直连 MAC，元素格式 "MAC|显示名"
+    declare -a name_targets=()
+    declare -a mac_targets=()
     local src="Blueman RecentConns 缓存"
 
-    # 1) 优先读 Blueman 缓存（自带 MAC，直接连）
-    local pairs
-    pairs="$(read_blueman_pairs || true)"
-    if [ -n "$pairs" ]; then
-        local alias addr
-        while IFS=$'\t' read -r alias addr; do
-            [ -z "$addr" ] && continue
-            targets["$addr"]="$alias"
-        done <<< "$pairs"
+    # 1) 优先读 Blueman 缓存（除非 --list 强制手动列表）
+    if [ "$force_list" -eq 0 ]; then
+        local pairs
+        pairs="$(read_blueman_pairs || true)"
+        if [ -n "$pairs" ]; then
+            local alias addr
+            while IFS=$'\t' read -r alias addr; do
+                [ -z "$alias" ] && continue
+                if [ "$mac_first" -eq 1 ] && [ -n "$addr" ]; then
+                    # MAC 优先：用缓存里的 address 直连
+                    mac_targets+=("${addr}|${alias}")
+                else
+                    # 名称优先：忽略缓存里的 MAC（可能已过期），只按 alias 扫描
+                    name_targets+=("$alias")
+                fi
+            done <<< "$pairs"
+        fi
     fi
 
-    # 2) 缓存为空 → 读手动列表
-    if [ ${#targets[@]} -eq 0 ]; then
+    # 2) 缓存为空（或 --list）→ 读手动列表
+    if [ ${#name_targets[@]} -eq 0 ] && [ ${#mac_targets[@]} -eq 0 ]; then
         src="手动列表 $MANUAL_LIST"
-        c_warn "Blueman 缓存为空，切换到手动列表"
+        c_warn "Blueman 缓存为空（或 --list），切换到手动列表"
         [ ! -f "$MANUAL_LIST" ] && { c_err "手动列表文件不存在：$MANUAL_LIST"; exit 1; }
-        local line mac name
+        local line name mac
         while IFS= read -r line; do
             line="$(echo "$line" | xargs)"
             [ -z "$line" ] && continue
             [[ "$line" =~ ^# ]] && continue
             mac="$(extract_mac "$line")"
             name="$(extract_name "$line")"
-            if [ -n "$mac" ]; then
-                targets["$mac"]="$name"
+            # 纯 MAC 条目时 extract_name 会返回空，这里归一化
+            [ "$name" = "$mac" ] && name=""
+
+            if [ "$mac_first" -eq 1 ]; then
+                # MAC 优先：有 MAC 就直连，没 MAC 才退化为名称匹配
+                if [ -n "$mac" ]; then
+                    mac_targets+=("${mac}|${name:-$mac}")
+                elif [ -n "$name" ]; then
+                    name_targets+=("$name")
+                fi
             else
-                # 纯名称条目：扫描时按 alias 匹配
-                targets["__NAME__::$name"]="$name"
+                # 名称优先：有名称就按名称匹配，没名称才退化为直连 MAC
+                if [ -n "$name" ]; then
+                    name_targets+=("$name")
+                elif [ -n "$mac" ]; then
+                    mac_targets+=("${mac}|${mac}")
+                fi
             fi
         done < "$MANUAL_LIST"
     fi
 
-    if [ ${#targets[@]} -eq 0 ]; then
+    if [ ${#name_targets[@]} -eq 0 ] && [ ${#mac_targets[@]} -eq 0 ]; then
         c_err "待连接列表为空，退出"
         exit 1
     fi
+
+    local mode_text
+    if [ "$mac_first" -eq 1 ]; then
+        mode_text="MAC 优先（直连）"
+    else
+        mode_text="名称优先（扫描匹配 + RSSI 择优）"
+    fi
     c_info "数据源：$src"
-    c_info "目标数量：${#targets[@]}"
+    c_info "匹配模式：$mode_text"
+    c_info "名称目标：${#name_targets[@]} 个，MAC 目标：${#mac_targets[@]} 个"
 
     local start_ts now elapsed all_ok
     start_ts="$(date +%s)"
@@ -234,39 +284,44 @@ cmd_run() {
         do_scan
         all_ok=1
 
-        local mac display
-        for mac in "${!targets[@]}"; do
-            display="${targets[$mac]}"
-
-            # 纯名称目标：从扫描结果里找 alias 匹配、RSSI 最强的那一个
-            if [[ "$mac" == __NAME__::* ]]; then
-                local want_name="${mac#__NAME__::}"
-                local best_mac="" best_rssi=-999 m r
-                for m in "${!found_alias[@]}"; do
-                    if [ "${found_alias[$m]}" = "$want_name" ]; then
-                        r="${found_rssi[$m]:-999}"
-                        if [ "$r" -gt "$best_rssi" ]; then
-                            best_rssi="$r"; best_mac="$m"
-                        fi
+        # ---- 处理「名称目标」：扫描 → 同名 RSSI 最强 → 连接 ----
+        local want_name best_mac best_rssi m r
+        for want_name in "${name_targets[@]}"; do
+            best_mac="" best_rssi=-999
+            for m in "${!found_alias[@]}"; do
+                if [ "${found_alias[$m]}" = "$want_name" ]; then
+                    r="${found_rssi[$m]:-999}"
+                    if [ "$r" -gt "$best_rssi" ]; then
+                        best_rssi="$r"; best_mac="$m"
                     fi
-                done
-                if [ -z "$best_mac" ]; then
-                    c_warn "未扫描到名称为 [$want_name] 的设备"
-                    all_ok=0
-                    continue
                 fi
-                c_info "[$want_name] 同名择优：$best_mac RSSI=$best_rssi"
-                mac="$best_mac"
+            done
+            if [ -z "$best_mac" ]; then
+                c_warn "未扫描到名称为 [$want_name] 的设备"
+                all_ok=0
+                continue
             fi
+            if is_connected "$best_mac"; then
+                c_ok "[$want_name] $best_mac 已连接"
+                continue
+            fi
+            all_ok=0
+            c_info "[$want_name] 同名择优：$best_mac RSSI=$best_rssi"
+            try_connect "$best_mac"
+        done
 
+        # ---- 处理「MAC 目标」：直接 connect（带 pair+trust 兜底）----
+        local entry mac display
+        for entry in "${mac_targets[@]}"; do
+            mac="${entry%%|*}"
+            display="${entry#*|}"
             if is_connected "$mac"; then
                 c_ok "$display ($mac) 已连接"
                 continue
             fi
             all_ok=0
-
             local rssi="${found_rssi[$mac]:-未知}"
-            c_info "尝试连接 $display ($mac) RSSI=$rssi"
+            c_info "直连 $display ($mac) RSSI=$rssi"
             try_connect "$mac"
         done
 
@@ -364,9 +419,10 @@ install_wizard() {
     chown "$CURR_USER:$CURR_USER" "$MANUAL_LIST" 2>/dev/null || true
 
     c_info "3/4 生成 systemd 单元 $SERVICE_PATH"
+    # 默认 ExecStart 不带 --mac-first，即默认名称优先
     cat > "$SERVICE_PATH" <<EOF
 [Unit]
-Description=Bluetooth Auto Connect (Blueman recentconns cache)
+Description=Bluetooth Auto Connect (name-first, Blueman recentconns cache)
 After=bluetooth.service
 Requires=bluetooth.service
 
@@ -388,10 +444,12 @@ EOF
     c_ok "安装完成！"
     echo
     echo "常用命令："
-    echo "  $SCRIPT_NAME run              # 手动跑一次连接流程"
-    echo "  $SCRIPT_NAME cache-list       # 查看 Blueman 最近连接"
-    echo "  $SCRIPT_NAME cache-del \"名字\" # 删除缓存项"
-    echo "  $SCRIPT_NAME list-list        # 查看手动列表"
+    echo "  $SCRIPT_NAME run                  # 默认：名称优先（扫描匹配 + RSSI 择优）"
+    echo "  $SCRIPT_NAME run --mac-first       # MAC 优先（直连缓存/列表里的 MAC）"
+    echo "  $SCRIPT_NAME run --list           # 强制走手动列表，不读 Blueman 缓存"
+    echo "  $SCRIPT_NAME cache-list            # 查看 Blueman 最近连接"
+    echo "  $SCRIPT_NAME cache-del \"名字\"      # 删除缓存项"
+    echo "  $SCRIPT_NAME list-list            # 查看手动列表"
     echo "  $SCRIPT_NAME list-add \"名字 AA:BB:CC:DD:EE:FF\""
     echo "  journalctl -u $SERVICE_NAME -f"
 }
@@ -400,7 +458,7 @@ EOF
 # 命令入口
 # ===========================================================================
 case "${1:-}" in
-    run)          cmd_run ;;
+    run)          shift; cmd_run "$@" ;;
     cache-list)   cmd_cache_list ;;
     cache-del)    shift; cmd_cache_del "$*" ;;
     list-list)    cmd_list_list ;;
@@ -409,13 +467,23 @@ case "${1:-}" in
     ""|install)   install_wizard ;;
     *)
         echo "用法："
-        echo "  $0                     无参数：进入安装向导"
-        echo "  $0 run                 执行自动连接（Blueman 缓存优先，失败回落手动列表）"
-        echo "  $0 cache-list          查看 Blueman 最近连接缓存"
-        echo "  $0 cache-del \"别名\"    删除 Blueman 缓存项"
-        echo "  $0 list-list            查看手动列表"
-        echo "  $0 list-add \"条目\"    添加手动条目（名称 / MAC / 名称 MAC）"
-        echo "  $0 list-del \"条目\"    删除手动条目"
+        echo "  $0                                无参数：进入安装向导"
+        echo
+        echo "  $0 run [选项]                     执行自动连接"
+        echo "    选项："
+        echo "      --name-first   （默认）按设备名称扫描匹配，同名按 RSSI 信号择优"
+        echo "                     适合外设 MAC 会变化、但名称固定的场景"
+        echo "      --mac-first     按 MAC 地址直连，跳过名称匹配"
+        echo "                     适合 MAC 固定、或强制直连某个设备"
+        echo "      --list          强制使用手动列表，不读 Blueman 托盘缓存"
+        echo
+        echo "  $0 cache-list                     查看 Blueman 最近连接缓存"
+        echo "  $0 cache-del \"别名\"               删除 Blueman 缓存项（托盘菜单同步消失）"
+        echo
+        echo "  $0 list-list                      查看手动列表"
+        echo "  $0 list-add \"条目\"               添加手动条目"
+        echo "                     条目格式：名称 / MAC / 名称 MAC"
+        echo "  $0 list-del \"条目\"                删除手动条目"
         exit 1
         ;;
 esac
